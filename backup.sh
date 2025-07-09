@@ -11,7 +11,7 @@ fi
 
 # === 安装所需软件 Install required packages ===
 echo "--- 阶段 1/8: 检查并安装所需软件 ---"
-REQUIRED_PKGS="dosfstools parted kpartx rsync jq"
+REQUIRED_PKGS="dosfstools parted kpartx rsync jq docker.io"
 for pkg in $REQUIRED_PKGS; do
     if ! dpkg -s "$pkg" &>/dev/null; then
         echo "安装 $pkg..."
@@ -99,13 +99,9 @@ fi
 
 # === 计算镜像大小（基于实际使用量+5%余量）===
 echo "--- 估算镜像大小（基于已用空间+5%余量） ---"
-# 获取根分区已用空间，单位KB
 ROOT_USED_KB=$(df -P "$ROOT_DEVICE_PARTITION" | tail -1 | awk '{print $3}')
-# 获取引导分区总大小，单位KB
 BOOT_TOTAL_KB=$(df -P "$BOOT_MOUNTPOINT" | tail -1 | awk '{print $2}')
-# 计算总大小 = 根已用 + 引导总大小
 TOTAL_KB=$((ROOT_USED_KB + BOOT_TOTAL_KB))
-# 加 5% 余量
 IMAGE_SIZE_KB=$((TOTAL_KB * 105 / 100))
 
 echo "根分区已用: $ROOT_USED_KB KB"
@@ -115,6 +111,19 @@ echo "镜像文件大小估算: $IMAGE_SIZE_KB KB (~$((IMAGE_SIZE_KB / 1024)) MB
 # === 用户确认 Confirmation ===
 read -p "是否继续创建系统备份？(y/N): " confirm
 [[ "$confirm" =~ ^[yY]$ ]] || { echo "已取消。"; exit 0; }
+
+# === 停止所有运行中的 Docker 容器 ===
+echo "--- 停止正在运行的 Docker 容器 ---"
+RUNNING_CONTAINERS=$(docker ps -q)
+if [ -n "$RUNNING_CONTAINERS" ]; then
+    echo "检测到运行中的容器，准备停止..."
+    docker stop $RUNNING_CONTAINERS
+    if [ $? -ne 0 ]; then
+        echo "警告：停止部分容器失败，请手动检查。"
+    fi
+else
+    echo "无运行中的 Docker 容器。"
+fi
 
 # === 创建镜像文件 ===
 echo "--- 阶段 4/8: 创建镜像文件 ---"
@@ -156,7 +165,6 @@ mount -t "$ROOT_FSTYPE" "$partRoot" /mnt/root_temp
 echo "复制引导分区..."
 cp -rfp "${BOOT_MOUNTPOINT}"/* /mnt/boot_temp/
 
-# 替换 cmdline.txt 的 PARTUUID
 NEW_BOOT_PARTUUID=$(blkid -o export "$partBoot" | grep PARTUUID | cut -d= -f2)
 NEW_ROOT_PARTUUID=$(blkid -o export "$partRoot" | grep PARTUUID | cut -d= -f2)
 [ -f /mnt/boot_temp/cmdline.txt ] && sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/" /mnt/boot_temp/cmdline.txt
@@ -167,22 +175,31 @@ rsync -aAXv /* /mnt/root_temp \
     --exclude=/tmp/* --exclude=/media/* --exclude=/mnt/* \
     --exclude="${BACKUP_DIR}/*" --exclude="$(pwd)/*" --exclude=/boot/*
 
-# 重建空目录
 for dir in dev proc sys run tmp mnt media boot; do
     mkdir -p "/mnt/root_temp/$dir"
 done
 chmod 1777 /mnt/root_temp/tmp
 
-# 替换 fstab 的 PARTUUID
 [ -f /mnt/root_temp/etc/fstab ] && {
     sed -i "s/$ORIG_BOOT_PARTUUID/$NEW_BOOT_PARTUUID/" /mnt/root_temp/etc/fstab
     sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/" /mnt/root_temp/etc/fstab
 }
 
-# === 卸载与完成 ===
+# === 卸载 ===
 echo "--- 阶段 8/8: 清理与完成 ---"
 sync
 umount /mnt/boot_temp /mnt/root_temp
 rmdir /mnt/boot_temp /mnt/root_temp
+
+# === 恢复之前停止的 Docker 容器 ===
+if [ -n "$RUNNING_CONTAINERS" ]; then
+    echo "--- 恢复之前停止的 Docker 容器 ---"
+    docker start $RUNNING_CONTAINERS
+    if [ $? -ne 0 ]; then
+        echo "警告：启动部分容器失败，请手动检查。"
+    else
+        echo "Docker 容器已恢复运行。"
+    fi
+fi
 
 echo "✅ 备份完成！镜像路径：$DEST_IMG_PATH"
