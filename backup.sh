@@ -1,141 +1,165 @@
 #!/bin/bash
 
-# ====================================================
-# Raspberry Pi 系统盘完整备份脚本（支持 NVMe）
-# 备份基于已用空间+20%余量估算大小
-# 备份时自动停止所有 Docker 容器，备份完成后恢复
-# 不排除任何目录，完整备份
-# 需要 root 权限运行
-# ====================================================
-
-# --- 配置变量 ---
-BACKUP_DIR="/media/8T/4Backups/Backup"  # 备份存储目录
+# --- 脚本配置变量 ---
+BACKUP_DIR="/media/8T/4Backups/Backup" # 备份镜像文件保存的目录
+TMP_MOUNT_BASE="/tmp/rpi_backup_mount"  # 临时挂载基目录，避免用 /mnt 造成风险
+MOUNT_BOOT="${TMP_MOUNT_BASE}/boot"
+MOUNT_ROOT="${TMP_MOUNT_BASE}/root"
 
 # --- 权限检查 ---
 if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：请使用 root 权限运行脚本（sudo）。"
+    echo "此脚本必须以 root 用户身份运行！请使用 sudo ./your_script_name.sh"
     exit 1
 fi
 
-# --- 安装必要软件 ---
+# --- 安装所需软件 ---
 echo "--- 阶段 1/8: 检查并安装所需软件 ---"
 REQUIRED_PKGS="dosfstools parted kpartx rsync jq"
 for pkg in $REQUIRED_PKGS; do
     if ! dpkg -s "$pkg" &>/dev/null; then
-        echo "安装软件包：$pkg ..."
-        apt update && apt install -y "$pkg" || {
-            echo "安装 $pkg 失败，退出。"
+        echo "正在安装 $pkg..."
+        apt update && apt install -y "$pkg"
+        if [ $? -ne 0 ]; then
+            echo "错误：安装 $pkg 失败。请检查网络连接或 APT 源。"
             exit 1
-        }
+        fi
     fi
 done
-echo "所有必需软件已安装。"
+echo "所有必要软件已准备就绪。"
 
-# --- 清理函数 ---
+# --- 定义清理函数 ---
 cleanup() {
     echo "--- 执行清理操作 ---"
-    umount /mnt/boot_temp &>/dev/null && rmdir /mnt/boot_temp &>/dev/null
-    umount /mnt/root_temp &>/dev/null && rmdir /mnt/root_temp &>/dev/null
+    # 解挂载临时挂载点，删除目录
+    for mp in "$MOUNT_BOOT" "$MOUNT_ROOT"; do
+        if mountpoint -q "$mp"; then
+            umount "$mp"
+            echo "卸载 $mp"
+        fi
+        if [ -d "$mp" ]; then
+            rmdir "$mp" 2>/dev/null && echo "删除空目录 $mp"
+        fi
+    done
+    # 删除基目录（如果空）
+    if [ -d "$TMP_MOUNT_BASE" ]; then
+        rmdir "$TMP_MOUNT_BASE" 2>/dev/null && echo "删除空目录 $TMP_MOUNT_BASE"
+    fi
+
+    # 解除循环设备映射
     if [ -n "$loopdevice" ] && losetup "$loopdevice" &>/dev/null; then
         kpartx -d "$loopdevice" &>/dev/null
         losetup -d "$loopdevice" &>/dev/null
-        echo "已卸载循环设备 $loopdevice。"
+        echo "已解除循环设备 $loopdevice 及其映射。"
     fi
+    echo "清理完成。"
 }
 trap cleanup EXIT
 
-# --- 创建备份目录 ---
+# --- 准备备份目录 ---
 echo "--- 阶段 2/8: 准备备份目录 ---"
-mkdir -p "$BACKUP_DIR" || {
-    echo "错误：无法创建备份目录 $BACKUP_DIR"
+mkdir -p "$BACKUP_DIR"
+if [ $? -ne 0 ]; then
+    echo "错误：无法创建备份目录 $BACKUP_DIR。请检查路径和权限。"
     exit 1
-}
-echo "备份目录已确认或创建：$BACKUP_DIR"
+fi
+echo "备份目录已确认/创建：$BACKUP_DIR"
 
-# --- 自动检测系统盘 ---
-echo "--- 阶段 3/8: 自动检测系统盘信息 ---"
+# --- 获取系统盘设备 ---
+echo "--- 阶段 3/8: 自动检测系统盘并获取信息 ---"
 ROOT_DEVICE_PARTITION=$(df -P / | tail -n 1 | awk '{print $1}')
+if [ -z "$ROOT_DEVICE_PARTITION" ]; then
+    echo "错误：无法确定根目录 / 的挂载分区。退出。"
+    exit 1
+fi
 
+# 解析设备名
 if [[ "$ROOT_DEVICE_PARTITION" =~ ^(/dev/mmcblk[0-9]+)p[0-9]+$ ]]; then
+    SD_DEVICE="${BASH_REMATCH[1]}"
+elif [[ "$ROOT_DEVICE_PARTITION" =~ ^(/dev/nvme[0-9]n[0-9]+)p[0-9]+$ ]]; then
     SD_DEVICE="${BASH_REMATCH[1]}"
 elif [[ "$ROOT_DEVICE_PARTITION" =~ ^(/dev/sd[a-z]+)[0-9]+$ ]]; then
     SD_DEVICE="${BASH_REMATCH[1]}"
-elif [[ "$ROOT_DEVICE_PARTITION" =~ ^(/dev/nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then
-    SD_DEVICE="${BASH_REMATCH[1]}"
 else
-    echo "错误：无法识别根目录设备类型（非 mmcblk/sd/nvme），退出。"
+    echo "错误：无法解析根目录所在设备的类型。退出。"
     exit 1
 fi
 
-BOOT_PART="${SD_DEVICE}1"
-ROOT_PART="${SD_DEVICE}2"
+echo "检测到系统盘设备为：$SD_DEVICE"
 
-PART_INFO=$(lsblk -o NAME,FSTYPE,MOUNTPOINT,MOUNTPOINTS,PARTUUID,SIZE -J "$SD_DEVICE") || {
-    echo "错误：获取设备 $SD_DEVICE 分区信息失败。"
+# 分区命名规则
+if [[ "$SD_DEVICE" =~ ^/dev/mmcblk ]] || [[ "$SD_DEVICE" =~ ^/dev/nvme ]]; then
+    BOOT_PART="${SD_DEVICE}p1"
+    ROOT_PART="${SD_DEVICE}p2"
+else
+    BOOT_PART="${SD_DEVICE}1"
+    ROOT_PART="${SD_DEVICE}2"
+fi
+
+if [ ! -b "$SD_DEVICE" ]; then
+    echo "错误：系统盘设备 $SD_DEVICE 不存在。"
     exit 1
-}
+fi
+
+# 读取分区信息
+PART_INFO=$(lsblk -o NAME,PARTUUID,FSTYPE,MOUNTPOINTS,SIZE "${SD_DEVICE}" -J)
+if [ $? -ne 0 ]; then
+    echo "错误：无法获取设备 $SD_DEVICE 的分区信息。"
+    exit 1
+fi
 
 BOOT_MOUNTPOINT=$(echo "$PART_INFO" | jq -r "
-  .blockdevices[] | (.children[]? // .) |
-  select(.name == \"$(basename "$BOOT_PART")\") |
-  (.mountpoint // .mountpoints[0] // \"\")
+    .blockdevices[] | (.children[]? // .) |
+    select(.name == \"$(basename "$BOOT_PART")\") | .mountpoints[0] // \"\"
 ")
 ORIG_BOOT_PARTUUID=$(echo "$PART_INFO" | jq -r "
-  .blockdevices[] | (.children[]? // .) |
-  select(.name == \"$(basename "$BOOT_PART")\") | .partuuid // \"\"
+    .blockdevices[] | (.children[]? // .) |
+    select(.name == \"$(basename "$BOOT_PART")\") | .partuuid // \"\"
 ")
 ORIG_ROOT_PARTUUID=$(echo "$PART_INFO" | jq -r "
-  .blockdevices[] | (.children[]? // .) |
-  select(.name == \"$(basename "$ROOT_PART")\") | .partuuid // \"\"
+    .blockdevices[] | (.children[]? // .) |
+    select(.name == \"$(basename "$ROOT_PART")\") | .partuuid // \"\"
 ")
 BOOT_FSTYPE=$(echo "$PART_INFO" | jq -r "
-  .blockdevices[] | (.children[]? // .) |
-  select(.name == \"$(basename "$BOOT_PART")\") | .fstype // \"\"
+    .blockdevices[] | (.children[]? // .) |
+    select(.name == \"$(basename "$BOOT_PART")\") | .fstype // \"\"
 ")
 ROOT_FSTYPE=$(echo "$PART_INFO" | jq -r "
-  .blockdevices[] | (.children[]? // .) |
-  select(.name == \"$(basename "$ROOT_PART")\") | .fstype // \"\"
+    .blockdevices[] | (.children[]? // .) |
+    select(.name == \"$(basename "$ROOT_PART")\") | .fstype // \"\"
 ")
 
-if [ -z "$BOOT_MOUNTPOINT" ] || [ -z "$ORIG_BOOT_PARTUUID" ] || [ -z "$ORIG_ROOT_PARTUUID" ]; then
-    echo "错误：无法获取关键分区信息，退出。"
+if [ -z "$BOOT_MOUNTPOINT" ] || [ -z "$ORIG_BOOT_PARTUUID" ] || [ -z "$ORIG_ROOT_PARTUUID" ] || [ -z "$BOOT_FSTYPE" ] || [ -z "$ROOT_FSTYPE" ]; then
+    echo "错误：未能获取完整系统盘分区信息，请检查。"
     exit 1
 fi
 
-# --- 计算镜像大小（已用空间 + 20%余量） ---
-ROOT_USED_KB=$(df -P "$ROOT_DEVICE_PARTITION" | tail -1 | awk '{print $3}')
-BOOT_TOTAL_KB=$(df -P "$BOOT_MOUNTPOINT" | tail -1 | awk '{print $2}')
-TOTAL_KB=$((ROOT_USED_KB + BOOT_TOTAL_KB))
-IMAGE_SIZE_KB=$((TOTAL_KB * 120 / 100))
+# 估算镜像大小（根分区已用空间+引导分区总空间）*1.2
+ROOT_USED_KB=$(df -P / | tail -n1 | awk '{print $3}')
+BOOT_TOTAL_KB=$(df -P "$BOOT_MOUNTPOINT" | tail -n1 | awk '{print $2}')
+IMAGE_SIZE_KB=$(( (ROOT_USED_KB + BOOT_TOTAL_KB) * 12 / 10 ))
 
 echo "系统盘设备: $SD_DEVICE"
 echo "引导分区挂载点: $BOOT_MOUNTPOINT (PARTUUID: $ORIG_BOOT_PARTUUID)"
 echo "根分区 PARTUUID: $ORIG_ROOT_PARTUUID"
-echo "估算镜像大小: $IMAGE_SIZE_KB KB (~$((IMAGE_SIZE_KB / 1024)) MB)"
+echo "估算镜像大小: $((IMAGE_SIZE_KB / 1024)) MB"
 
-read -p "确认开始备份？(y/N): " confirm
+read -p "请确认以上信息无误，即将创建系统盘备份镜像文件。(y/N): " confirm
 if [[ ! "$confirm" =~ ^[yY]$ ]]; then
     echo "备份已取消。"
     exit 0
 fi
 
-# --- 停止 Docker 容器 ---
-echo "--- 停止运行中的 Docker 容器 ---"
-RUNNING_CONTAINERS=$(docker ps -q)
-if [ -n "$RUNNING_CONTAINERS" ]; then
-    docker stop $RUNNING_CONTAINERS || echo "警告：停止 Docker 容器失败，请检查。"
-else
-    echo "无运行中的 Docker 容器。"
-fi
+# --- 创建空镜像文件 ---
+echo "--- 阶段 4/8: 创建空的镜像文件 ---"
+IMAGE_FILE_NAME="rpi-$(date +%Y%m%d%H%M%S).img"
+DEST_IMG_PATH="${BACKUP_DIR}/${IMAGE_FILE_NAME}"
 
-# --- 创建镜像文件 ---
-echo "--- 阶段 4/8: 创建空镜像文件 ---"
-IMAGE_FILE="rpi-$(date +%Y%m%d%H%M%S).img"
-DEST_IMG_PATH="$BACKUP_DIR/$IMAGE_FILE"
-dd if=/dev/zero of="$DEST_IMG_PATH" bs=1K count=0 seek="$IMAGE_SIZE_KB" status=progress || {
+echo "正在创建镜像文件：$DEST_IMG_PATH (约 $((IMAGE_SIZE_KB / 1024)) MB)..."
+dd if=/dev/zero of="$DEST_IMG_PATH" bs=1K count=0 seek="$IMAGE_SIZE_KB" status=progress
+if [ $? -ne 0 ]; then
     echo "错误：创建镜像文件失败。"
     exit 1
-}
+fi
 
 # --- 创建分区表 ---
 echo "--- 阶段 5/8: 创建分区表 ---"
@@ -143,85 +167,116 @@ PARTED_INFO=$(fdisk -l "$SD_DEVICE")
 BOOT_START_SECTOR=$(echo "$PARTED_INFO" | grep "^${BOOT_PART}" | awk '{print $2}')
 BOOT_END_SECTOR=$(echo "$PARTED_INFO" | grep "^${BOOT_PART}" | awk '{print $3}')
 ROOT_START_SECTOR=$(echo "$PARTED_INFO" | grep "^${ROOT_PART}" | awk '{print $2}')
+
 if [ -z "$BOOT_START_SECTOR" ] || [ -z "$BOOT_END_SECTOR" ] || [ -z "$ROOT_START_SECTOR" ]; then
-    echo "错误：解析分区起始/结束扇区失败。"
+    echo "错误：无法解析分区起始/结束扇区。"
     exit 1
 fi
 
-parted "$DEST_IMG_PATH" --script mklabel msdos
-parted "$DEST_IMG_PATH" --script mkpart primary fat32 "${BOOT_START_SECTOR}s" "${BOOT_END_SECTOR}s"
-parted "$DEST_IMG_PATH" --script mkpart primary ext4 "${ROOT_START_SECTOR}s" 100%
+parted "$DEST_IMG_PATH" --script -- mklabel msdos
+parted "$DEST_IMG_PATH" --script -- mkpart primary fat32 "${BOOT_START_SECTOR}s" "${BOOT_END_SECTOR}s"
+parted "$DEST_IMG_PATH" --script -- mkpart primary ext4 "${ROOT_START_SECTOR}s" "100%"
 
-# --- 挂载并格式化镜像 ---
-echo "--- 阶段 6/8: 挂载并格式化镜像分区 ---"
-loopdevice=$(losetup -f --show "$DEST_IMG_PATH") || {
-    echo "错误：设置循环设备失败。"
+echo "分区表创建完成。"
+
+# --- 挂载镜像文件并格式化 ---
+echo "--- 阶段 6/8: 挂载镜像并格式化 ---"
+loopdevice=$(losetup -f --show "$DEST_IMG_PATH")
+if [ -z "$loopdevice" ]; then
+    echo "错误：挂载循环设备失败。"
     exit 1
-}
-kpartx -va "$loopdevice" || {
-    echo "错误：映射循环设备分区失败。"
-    exit 1
-}
-sleep 2
-device_mapper=$(basename "$loopdevice")
-partBoot="/dev/mapper/${device_mapper}p1"
-partRoot="/dev/mapper/${device_mapper}p2"
+fi
+
+kpartx -va "$loopdevice"
+sleep 2s
+
+device_mapper_name=$(basename "$loopdevice")
+partBoot="/dev/mapper/${device_mapper_name}p1"
+partRoot="/dev/mapper/${device_mapper_name}p2"
+
 if [ ! -b "$partBoot" ] || [ ! -b "$partRoot" ]; then
-    echo "错误：映射的分区设备不存在。"
+    echo "错误：映射分区不存在。"
     exit 1
 fi
 
-mkfs.vfat -F32 -n boot "$partBoot" || {
-    echo "错误：格式化引导分区失败。"
-    exit 1
-}
-mkfs.ext4 -F "$partRoot" || {
-    echo "错误：格式化根分区失败。"
-    exit 1
-}
+echo "格式化引导分区 $partBoot ..."
+mkfs.vfat -F 32 -n boot "$partBoot"
+echo "格式化根分区 $partRoot ..."
+mkfs.ext4 -F "$partRoot"
 e2label "$partRoot" rootfs
 
-# --- 复制数据 ---
-echo "--- 阶段 7/8: 复制数据 ---"
-mkdir -p /mnt/boot_temp /mnt/root_temp
-mount -t "$BOOT_FSTYPE" "$partBoot" /mnt/boot_temp || { echo "挂载引导分区失败"; exit 1; }
-mount -t "$ROOT_FSTYPE" "$partRoot" /mnt/root_temp || { echo "挂载根分区失败"; exit 1; }
+# --- 挂载镜像分区 ---
+echo "--- 阶段 7/8: 挂载镜像分区 ---"
+mkdir -p "$MOUNT_BOOT" "$MOUNT_ROOT"
 
+mount -t "$BOOT_FSTYPE" "$partBoot" "$MOUNT_BOOT"
+if ! mountpoint -q "$MOUNT_BOOT"; then
+    echo "错误：引导分区挂载失败。"
+    exit 1
+fi
+
+mount -t "$ROOT_FSTYPE" "$partRoot" "$MOUNT_ROOT"
+if ! mountpoint -q "$MOUNT_ROOT"; then
+    echo "错误：根分区挂载失败。"
+    umount "$MOUNT_BOOT"
+    exit 1
+fi
+
+# --- 停止所有 Docker 容器 ---
+echo "--- 阶段 8/8: 停止所有 Docker 容器 ---"
+RUNNING_CONTAINERS=$(docker ps -q)
+if [ -n "$RUNNING_CONTAINERS" ]; then
+    echo "停止容器: $RUNNING_CONTAINERS"
+    docker stop $RUNNING_CONTAINERS
+else
+    echo "无运行的 Docker 容器。"
+fi
+
+# --- 复制引导分区内容 ---
 echo "复制引导分区内容..."
-cp -rfp "${BOOT_MOUNTPOINT}"/* /mnt/boot_temp/ || { echo "复制引导分区失败"; exit 1; }
+cp -a "$BOOT_MOUNTPOINT/"* "$MOUNT_BOOT/"
 
+# --- 更新 cmdline.txt 中的根 PARTUUID ---
 NEW_BOOT_PARTUUID=$(blkid -o export "$partBoot" | grep PARTUUID | cut -d= -f2)
 NEW_ROOT_PARTUUID=$(blkid -o export "$partRoot" | grep PARTUUID | cut -d= -f2)
 
-if [ -f /mnt/boot_temp/cmdline.txt ]; then
-    sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/g" /mnt/boot_temp/cmdline.txt
+if [ -f "$MOUNT_BOOT/cmdline.txt" ] && [ -w "$MOUNT_BOOT/cmdline.txt" ]; then
+    sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/g" "$MOUNT_BOOT/cmdline.txt"
+else
+    echo "警告：cmdline.txt 不存在或不可写，跳过更新。"
 fi
 
-echo "复制根文件系统内容，可能耗时较长，请耐心等待..."
-rsync -aAXv /* /mnt/root_temp \
-    --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/run/* \
-    --exclude=/tmp/* --exclude=/media/* --exclude=/mnt/* \
-    --exclude="${BACKUP_DIR}/*" --exclude="$(pwd)/*" --exclude=/boot/*
+# --- 复制根文件系统内容 ---
+echo "复制根文件系统内容 (这可能需要较长时间)..."
+rsync -aAXv --delete \
+    --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/run/*" \
+    --exclude="/media/*" --exclude="/tmp/*" --exclude="/mnt/*" --exclude="/lost+found" \
+    --exclude="$BACKUP_DIR/*" --exclude="$(pwd)/*" \
+    / "$MOUNT_ROOT/"
 
-# 创建必要空目录
+# --- 创建空目录 ---
 for d in dev proc sys run media mnt boot tmp; do
-    mkdir -p /mnt/root_temp/$d
+    mkdir -p "$MOUNT_ROOT/$d"
 done
-chmod a+w /mnt/root_temp/tmp
+chmod a+w "$MOUNT_ROOT/tmp"
 
-# 更新 fstab 中 PARTUUID
-if [ -f /mnt/root_temp/etc/fstab ]; then
-    sed -i "s/$ORIG_BOOT_PARTUUID/$NEW_BOOT_PARTUUID/g" /mnt/root_temp/etc/fstab
-    sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/g" /mnt/root_temp/etc/fstab
+# --- 更新 fstab 中 PARTUUID ---
+if [ -f "$MOUNT_ROOT/etc/fstab" ] && [ -w "$MOUNT_ROOT/etc/fstab" ]; then
+    sed -i "s/$ORIG_BOOT_PARTUUID/$NEW_BOOT_PARTUUID/g" "$MOUNT_ROOT/etc/fstab"
+    sed -i "s/$ORIG_ROOT_PARTUUID/$NEW_ROOT_PARTUUID/g" "$MOUNT_ROOT/etc/fstab"
+else
+    echo "警告：fstab 不存在或不可写，跳过更新。"
 fi
 
 sync
-umount /mnt/boot_temp
-umount /mnt/root_temp
-rmdir /mnt/boot_temp /mnt/root_temp
+
+# --- 卸载镜像分区 ---
+umount "$MOUNT_BOOT"
+umount "$MOUNT_ROOT"
+rmdir "$MOUNT_BOOT" "$MOUNT_ROOT"
 
 # --- 恢复 Docker 容器 ---
-echo "--- 阶段 8/8: 恢复 Docker 容器 ---"
+echo "恢复之前停止的 Docker 容器..."
 if [ -n "$RUNNING_CONTAINERS" ]; then
     docker start $RUNNING_CONTAINERS || echo "警告：Docker 容器启动失败。"
 else
@@ -229,3 +284,5 @@ else
 fi
 
 echo "✅ 备份完成，镜像路径：$DEST_IMG_PATH"
+
+# 脚本结束，cleanup 自动执行
