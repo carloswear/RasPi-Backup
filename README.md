@@ -1,5 +1,5 @@
 # RasPi-Backup
-I will now generate the README file in both Chinese and English based on the provided script.
+Tested on my Pi 4B/5 64bit bookworm
 
 -----
 
